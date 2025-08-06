@@ -1,1 +1,12 @@
- 
+ openai
+langchain
+faiss-cpu
+tiktoken
+python-dotenv
+streamlit
+PyPDF2
+unstructured
+markdown
+requests
+pandas
+
