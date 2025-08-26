@@ -1,1 +1,8 @@
- 
+streamlit
+pandas
+numpy
+requests
+matplotlib
+python-dotenv
+beautifulsoup4
+openai
