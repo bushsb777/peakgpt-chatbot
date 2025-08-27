@@ -1,18 +1,12 @@
 # app_dual.py — AlphaBot with dual scoring engines (Momentum & Mean-Value)
-# PATCHED: Added mean-value engine with toggle, rebound gate, and engine field in output.
-# Original momentum logic remains unchanged.
-
-# Notes:
-# - Momentum uses risk‑adjusted 12‑1 multi‑horizon (3/6/12 months, skip last 21 days).
-# - Mean-value is long-only mean reversion (z-score, RSI, Bollinger Bands, volatility normalization).
-# - Required keys in .env: FMP_API_KEY, FINNHUB_API_KEY, SERPAPI_API_KEY
-# - Optional keys: POLYGON_API_KEY, TIINGO_API_KEY
+# UPDATED: Reads API keys from Streamlit Secrets first (fallback to env vars);
+# adds safe DataFrame→Markdown fallback to avoid missing 'tabulate';
+# shows vendor-key status in sidebar diagnostics.
 
 import os
 import re
 import json
 import time
-import hashlib
 import requests
 import pandas as pd
 import numpy as np
@@ -24,43 +18,64 @@ from uuid import uuid4
 from typing import List, Dict
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Helpers: secrets/env retrieval & safe markdown tables
 
-# OpenAI client (guarded)
+def _secret(name: str, default: str = "") -> str:
+    """Return a secret from st.secrets if present, else from environment."""
+    try:
+        if name in st.secrets:  # Mapping-like in Streamlit Cloud
+            v = st.secrets[name]
+            if v is not None and str(v).strip() != "":
+                return str(v)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def df_to_markdown_safe(df: pd.DataFrame, index: bool = False) -> str:
+    """Render DataFrame as Markdown if 'tabulate' is available, else plain text.
+    This avoids ImportError when 'tabulate' isn't in requirements.
+    """
+    try:
+        import tabulate  # noqa: F401
+        return df.to_markdown(index=index)
+    except Exception:
+        return "```\n" + df.to_string(index=index) + "\n```"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional third‑party clients
 try:
-    from openai import OpenAI  # v1.x style
-    _openai_import_ok = True
+    from openai import OpenAI  # v1.x client
+    _openai_ok = True
 except Exception:
     OpenAI = None
-    _openai_import_ok = False
+    _openai_ok = False
 
-# Optional .env
+# Optional .env support for local dev; Streamlit Cloud will use st.secrets
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Optional parser for URL summaries
 try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Keys / clients (now secrets‑aware)
+FMP_API_KEY      = _secret("FMP_API_KEY")
+FINNHUB_API_KEY  = _secret("FINNHUB_API_KEY")
+SERPAPI_API_KEY  = _secret("SERPAPI_API_KEY")
+POLYGON_API_KEY  = _secret("POLYGON_API_KEY")
+TIINGO_API_KEY   = _secret("TIINGO_API_KEY")
+OPENAI_MODEL     = _secret("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY   = _secret("OPENAI_API_KEY")
 
-# Keys / clients
-FMP_API_KEY = os.getenv("FMP_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# Optional extra vendors
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-TIINGO_API_KEY  = os.getenv("TIINGO_API_KEY", "")
-
-if _openai_import_ok:
+if _openai_ok and OPENAI_API_KEY:
     try:
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
         client = None
 else:
@@ -68,18 +83,15 @@ else:
 
 DISCLAIMER = "_Educational content only. Not investment advice._"
 RULES_VERSION = "2025-08-14-v6"
-
-# Where to store audit records
-LEDGER_DIR = os.getenv("LEDGER_DIR", "audit/ledger")
+LEDGER_DIR = _secret("LEDGER_DIR", "audit/ledger")
 
 st.set_page_config(page_title="AlphaGPT – Financial Intelligence Bot", page_icon="🧠", layout="wide")
 st.title("🧠 AlphaGPT – Financial Intelligence Bot")
 st.caption("AlphaBot: Daily Buy, Sell, or Hold Signals.")
 
-# Sidebar toggle for selecting scoring engine
+# Sidebar – engine selection & toggles
 engine_choice = st.sidebar.radio("Scoring Engine:", ["Momentum", "Mean Value"], index=0)
 
-# Streamlit toggle shim (older versions may not have sidebar.toggle)
 def sidebar_toggle(label: str, value: bool = False):
     if hasattr(st.sidebar, "toggle"):
         return st.sidebar.toggle(label, value=value)
@@ -87,7 +99,6 @@ def sidebar_toggle(label: str, value: bool = False):
 
 show_diag = sidebar_toggle("🔧 Diagnostics", value=False)
 show_deep = sidebar_toggle("🔎 Deep Dive (detailed)", value=True)
-# NEW: force‑live toggle (bypass nightly precompute)
 force_live = sidebar_toggle("🚫 Use nightly precompute (serve live data)", value=False)
 
 _diag = []
@@ -95,6 +106,18 @@ _diag = []
 def dlog(tag, **kw):
     if show_diag:
         _diag.append({"tag": tag, **kw})
+
+# Quick visibility of which vendor keys are wired up
+if show_diag:
+    st.sidebar.markdown("**API status**")
+    st.sidebar.write({
+        "FMP_API_KEY": bool(FMP_API_KEY),
+        "FINNHUB_API_KEY": bool(FINNHUB_API_KEY),
+        "SERPAPI_API_KEY": bool(SERPAPI_API_KEY),
+        "POLYGON_API_KEY": bool(POLYGON_API_KEY),
+        "TIINGO_API_KEY": bool(TIINGO_API_KEY),
+        "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+    })
 
 TICKER_RE = re.compile(r"\b[A-Za-z]{1,6}\b")
 URL_RE = re.compile(r"https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+", re.IGNORECASE)
@@ -105,7 +128,6 @@ CRYPTO_GUESS = {
     "SUI","TON","NEAR","ALGO","FIL","ICP","HBAR","EGLD","AAVE","UNI"
 }
 
-# Precomputed cache reader (instant lookups)
 PRECOMP_PATH = Path("precomputed/latest.json")
 
 @st.cache_data(ttl=15*60, show_spinner=False)
@@ -120,7 +142,8 @@ def precomputed_lookup(symbol: str) -> dict:
     idx = load_precomputed_index() or {}
     return idx.get((symbol or "").upper(), {})
 
-# Markdown safety helpers
+# Markdown escape helper
+
 def md_escape(s: str) -> str:
     if not s:
         return ""
@@ -136,7 +159,8 @@ def md_escape(s: str) -> str:
         clean.append(ln)
     return "\n".join(clean)
 
-# HTTP helpers (with simple circuit breaker)
+# HTTP with simple circuit breaker
+
 def _get_json(url, params=None, headers=None, tries=2, timeout=20, soft=False, provider="fmp"):
     key = f"circuit_{provider}_until"
     until = st.session_state.get(key, 0)
@@ -242,7 +266,6 @@ def finnhub_quote(symbol: str):
     except Exception:
         return {}
 
-# Finnhub daily candles (stocks)
 @st.cache_data(ttl=24*3600)
 def finnhub_stock_candles(symbol: str, days: int = 400) -> List[Dict]:
     if not FINNHUB_API_KEY:
@@ -271,7 +294,6 @@ def finnhub_stock_candles(symbol: str, days: int = 400) -> List[Dict]:
     except Exception:
         return []
 
-# Finnhub daily candles (crypto via BINANCE:SYMBOLUSDT)
 @st.cache_data(ttl=24*3600)
 def finnhub_crypto_candles(symbol: str, days: int = 400) -> List[Dict]:
     if not FINNHUB_API_KEY:
@@ -302,7 +324,7 @@ def finnhub_crypto_candles(symbol: str, days: int = 400) -> List[Dict]:
     except Exception:
         return []
 
-# Tiingo & Polygon (EOD) — new helpers
+# Tiingo & Polygon EOD
 @st.cache_data(ttl=24*3600)
 def tiingo_history(symbol: str, days: int = 400) -> list[dict]:
     if not TIINGO_API_KEY:
@@ -348,42 +370,36 @@ def polygon_history(symbol: str, days: int = 400) -> list[dict]:
     except Exception:
         return []
 
-# Unified history fallback (FMP → Finnhub crypto → Finnhub stock → Polygon → Tiingo)
+# Unified history fallback
 @st.cache_data(ttl=24*3600)
 def history_any(symbol: str, days: int = 400) -> list[dict]:
     sym = (symbol or "").upper()
-    # 1) FMP
     h = fmp_history(sym, days=days)
     if len(h) >= 280:
         dlog("hist_vendor", vendor="fmp", len=len(h))
         return h
-    # 2) Crypto route first if looks like crypto
     if sym in CRYPTO_GUESS:
         hc = finnhub_crypto_candles(sym, days=days)
         if len(hc) >= 280:
             dlog("hist_vendor", vendor="finnhub_crypto", len=len(hc))
             return hc
-    # 3) Finnhub stock/ETF
     hs = finnhub_stock_candles(sym, days=days)
     if len(hs) >= 280:
         dlog("hist_vendor", vendor="finnhub_stock", len=len(hs))
         return hs
-    # 4) Polygon
     hp = polygon_history(sym, days=days)
     if len(hp) >= 280:
         dlog("hist_vendor", vendor="polygon", len=len(hp))
         return hp
-    # 5) Tiingo
     ht = tiingo_history(sym, days=days)
     if len(ht) >= 280:
         dlog("hist_vendor", vendor="tiingo", len=len(ht))
         return ht
-    # best effort; diagnostics will warn if short
     best = max([h, hs, hp, ht], key=lambda z: len(z) if z else 0) or []
     dlog("hist_vendor", vendor="best_effort", len=len(best))
     return best
 
-# Headlines (SerpAPI) — with Diagnostics logs
+# Headlines (SerpAPI)
 @st.cache_data(ttl=3600)
 def news_search(symbol: str, is_crypto: bool, n: int = 6):
     if not SERPAPI_API_KEY:
@@ -435,7 +451,7 @@ def sentiment_from_headlines(symbol: str, is_crypto: bool):
         return "Bearish", len(heads)
     return "Neutral", len(heads)
 
-# URL summarizer (paywall‑aware)
+# URL summarizer
 @st.cache_data(ttl=3600)
 def fetch_url_text(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0 (AlphaBot)"}
@@ -487,12 +503,14 @@ try:
 except Exception:
     pass
 
-# Scoring engine (with breakdown & confidence)
+# Scoring engine utilities
+
 def _safe_pct(a, b):
     try:
         return (a - b) / b
     except Exception:
         return 0.0
+
 
 def _blend_momentum_12_1_multihorizon(closes: np.ndarray, skip_days: int = 21):
     if closes is None or len(closes) < (252 + skip_days + 1):
@@ -500,11 +518,13 @@ def _blend_momentum_12_1_multihorizon(closes: np.ndarray, skip_days: int = 21):
     t = len(closes) - 1 - skip_days
     if t - 252 < 0:
         return 0.0, 0.0, 0.0, 0.0, 50.0
+
     def k_return(k_days: int) -> float:
         try:
             return _safe_pct(closes[t], closes[max(0, t - k_days)])
         except Exception:
             return 0.0
+
     r3 = k_return(63)
     r6 = k_return(126)
     r12 = k_return(252)
@@ -520,6 +540,7 @@ def _blend_momentum_12_1_multihorizon(closes: np.ndarray, skip_days: int = 21):
     raw = 0.2 * s3 + 0.3 * s6 + 0.5 * s12
     scaled = float(np.clip(50 + 25 * raw, 0, 100))
     return float(r3), float(r6), float(r12), float(raw), scaled
+
 
 def compute_momentum_breakdown(prices: list[dict]):
     need = 252 + 21 + 1
@@ -549,6 +570,7 @@ def compute_momentum_breakdown(prices: list[dict]):
         "cash_score": None,
         "cash_raw": None,
     }
+
 
 def compute_mean_value_breakdown(prices: list[dict]):
     have = len(prices or [])
@@ -602,6 +624,7 @@ def compute_mean_value_breakdown(prices: list[dict]):
         "bandwidth": round(bandwidth, 2) if bandwidth is not None else 0.0
     }
 
+
 def map_signal(score: float, sentiment: str, above_cash: bool = True) -> str:
     if not above_cash:
         return "Sell"
@@ -610,6 +633,7 @@ def map_signal(score: float, sentiment: str, above_cash: bool = True) -> str:
     if score < 40 or sentiment == "Bearish":
         return "Sell"
     return "Hold"
+
 
 def confidence_meter(score: float, sentiment: str, has_hist: bool, headlines_n: int, has_quote: bool, above_cash: bool = True) -> int:
     base = 0
@@ -642,31 +666,30 @@ def latest_filing_summary(symbol: str) -> dict:
     except Exception:
         return {}
 
-# 72h‑cached analysis (multi-engine)
+# 72h‑cached analysis (multi‑engine)
 @st.cache_data(ttl=72*3600, show_spinner=False)
 def get_analysis(symbol: str, rules_version: str, engine: str = "Momentum"):
     sym = symbol.upper()
-    # Precompute fast path (Momentum only, unless force_live)
     if engine == "Momentum":
         pc = precomputed_lookup(sym)
         if pc and not force_live:
             pc["engine"] = engine
             return pc
     is_crypto = sym in CRYPTO_GUESS
-    # Quotes / profiles with fallback
     quote = fmp_quote(sym) or finnhub_quote(sym)
     profile = fmp_profile(sym) or finnhub_profile(sym)
-    # Price history
     hist = history_any(sym, days=400)
     dlog("fetched", symbol=sym, quote=bool(quote), profile=bool(profile), hist=len(hist))
+
     if engine == "Momentum":
         brk = compute_momentum_breakdown(hist)
     else:
         brk = compute_mean_value_breakdown(hist)
+
     if brk.get("warning"):
         dlog("history_warning", msg=brk["warning"])
+
     if engine == "Momentum":
-        # Compare against cash benchmark (BIL)
         if "_bil_brk" not in st.session_state:
             try:
                 bil_hist = history_any("BIL", days=400)
@@ -683,7 +706,9 @@ def get_analysis(symbol: str, rules_version: str, engine: str = "Momentum"):
             above_cash = True
     else:
         above_cash = True
+
     sentiment, headlines_n = sentiment_from_headlines(sym, is_crypto)
+
     if engine == "Momentum":
         signal = map_signal(brk["score"], sentiment, above_cash=above_cash)
     else:
@@ -698,6 +723,7 @@ def get_analysis(symbol: str, rules_version: str, engine: str = "Momentum"):
             signal = "Sell"
         else:
             signal = "Hold"
+
     conf = confidence_meter(brk["score"], sentiment, has_hist=len(hist)>=260, headlines_n=headlines_n, has_quote=bool(quote), above_cash=above_cash)
     name = (quote.get("name") if isinstance(quote, dict) else None) or (profile.get("companyName") if isinstance(profile, dict) else None) or sym
     price = (quote.get("price") if isinstance(quote, dict) else None) or (quote.get("previousClose") if isinstance(quote, dict) else None)
@@ -735,6 +761,7 @@ def get_analysis(symbol: str, rules_version: str, engine: str = "Momentum"):
     return result
 
 # Explainability + ledger
+
 def rule_based_rationale(a: dict) -> str:
     engine = a.get("engine", "Momentum")
     if engine == "Momentum":
@@ -789,6 +816,7 @@ def write_ledger_entry_quick(a: dict, rationale: str) -> str:
     return str(fpath)
 
 # Render helpers
+
 def render_card(a: dict) -> str:
     if not a or a.get("error"):
         return "I couldn't fetch data for that ticker. Try another one."
@@ -804,32 +832,29 @@ def render_card(a: dict) -> str:
     lines.append(f"**Confidence (72h):** {a['confidence']}%")
     return "\n\n".join(lines)
 
+
 def render_deep(a: dict) -> str:
     if not a or a.get("error"):
         return ""
     if a.get("engine") == "Mean Value":
         m = a["mean_value"]
-    else:
-        m = a["momentum"]
-    out = []
-    if m.get("warning"):
-        out.append("**⚠️ Data warning:** " + md_escape(m["warning"]))
-        out.append("")
-    if a.get("engine") == "Mean Value":
         rows = pd.DataFrame({
             "Component": ["RSI (14d)", "20d Z-score", "20d Bollinger band width (%)", "Mean-Value Score"],
             "Value": [m.get("rsi"), m.get("zscore"), m.get("bandwidth"), m.get("score")]
         })
     else:
+        m = a["momentum"]
         rows = pd.DataFrame({
             "Component": ["R_3m (ex-1m)", "R_6m (ex-1m)", "R_12m (ex-1m)", "Risk-adj composite"],
             "Value": [m.get("r3m"), m.get("r6m"), m.get("r12m"), m.get("raw_score")]
         })
-    out += ["### 🔎 Deep Dive", "", rows.to_markdown(index=False)]
+    out = ["### 🔎 Deep Dive", "", df_to_markdown_safe(rows, index=False)]
+
     f = {k: v for k, v in a.get("fundamentals", {}).items() if v not in (None, "", "nan")}
     if f:
         f_rows = pd.DataFrame({"Metric": list(f.keys()), "Value": list(f.values())})
-        out += ["", "#### Key fundamentals", f_rows.to_markdown(index=False)]
+        out += ["", "#### Key fundamentals", df_to_markdown_safe(f_rows, index=False)]
+
     heads = a.get("headlines") or []
     if heads:
         lines = ["", "#### Latest headlines", ""]
@@ -840,6 +865,7 @@ def render_deep(a: dict) -> str:
             lines.append(f"- [{title}]({link})\n\n    {snip}")
         out += lines
     return "\n\n".join(out)
+
 
 def draw_chart(a: dict):
     hist = a.get("history") or []
